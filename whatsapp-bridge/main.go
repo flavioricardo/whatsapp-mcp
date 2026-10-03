@@ -60,7 +60,16 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Create tables if they don't exist
-	_, err = db.Exec(`
+	_, err = db.Exec(messagesSchema)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	return &MessageStore{db: db}, nil
+}
+
+const messagesSchema = `
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
@@ -84,13 +93,111 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
-	`)
+	`
+
+// toPN resolves a LID JID (@lid) to its phone-number JID using whatsmeow's
+// LID map, so chats and senders are keyed by phone number. Other JIDs, and
+// LIDs with no known mapping, are returned unchanged.
+func toPN(client *whatsmeow.Client, jid types.JID) types.JID {
+	jid = jid.ToNonAD()
+	if jid.Server != types.HiddenUserServer {
+		return jid
+	}
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pn.IsEmpty() {
+		return jid
+	}
+	return pn
+}
+
+// migrateLIDs re-keys chats and message senders stored under LID JIDs (by
+// bridge versions without toPN) to their phone-number JIDs.
+func migrateLIDs(db *sql.DB, toPN func(types.JID) types.JID, nameFor func(types.JID) string) error {
+	tx, err := db.Begin()
 	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		return err
+	}
+	defer tx.Rollback()
+
+	var lidChats []string
+	rows, err := tx.Query("SELECT jid FROM chats WHERE jid LIKE '%@lid'")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var j string
+		if err := rows.Scan(&j); err != nil {
+			rows.Close()
+			return err
+		}
+		lidChats = append(lidChats, j)
+	}
+	rows.Close()
+
+	for _, lidStr := range lidChats {
+		lid, err := types.ParseJID(lidStr)
+		if err != nil {
+			continue
+		}
+		pn := toPN(lid)
+		if pn.Server != types.DefaultUserServer {
+			continue // no mapping known yet
+		}
+		pnStr := pn.String()
+		// Create the PN chat if missing, keep the newest last_message_time, then move messages.
+		stmts := []struct {
+			q    string
+			args []interface{}
+		}{
+			{"INSERT OR IGNORE INTO chats (jid, name, last_message_time) SELECT ?, ?, last_message_time FROM chats WHERE jid = ?", []interface{}{pnStr, nameFor(pn), lidStr}},
+			{"UPDATE chats SET last_message_time = (SELECT MAX(last_message_time) FROM chats WHERE jid IN (?, ?)) WHERE jid = ?", []interface{}{pnStr, lidStr, pnStr}},
+			{"UPDATE OR REPLACE messages SET chat_jid = ? WHERE chat_jid = ?", []interface{}{pnStr, lidStr}},
+			{"DELETE FROM chats WHERE jid = ?", []interface{}{lidStr}},
+		}
+		for _, s := range stmts {
+			if _, err := tx.Exec(s.q, s.args...); err != nil {
+				return err
+			}
+		}
 	}
 
-	return &MessageStore{db: db}, nil
+	// Senders are stored either as a bare user ("123") or a full JID ("123@lid").
+	var senders []string
+	rows, err = tx.Query("SELECT DISTINCT sender FROM messages WHERE sender IS NOT NULL AND sender != ''")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			rows.Close()
+			return err
+		}
+		senders = append(senders, s)
+	}
+	rows.Close()
+
+	for _, s := range senders {
+		var newSender string
+		if strings.HasSuffix(s, "@"+types.HiddenUserServer) {
+			if j, err := types.ParseJID(s); err == nil {
+				if pn := toPN(j); pn.Server == types.DefaultUserServer {
+					newSender = pn.String()
+				}
+			}
+		} else if !strings.Contains(s, "@") {
+			if pn := toPN(types.NewJID(s, types.HiddenUserServer)); pn.Server == types.DefaultUserServer {
+				newSender = pn.User
+			}
+		}
+		if newSender != "" {
+			if _, err := tx.Exec("UPDATE messages SET sender = ? WHERE sender = ?", newSender, s); err != nil {
+				return err
+			}
+		}
+	}
+
+	return tx.Commit()
 }
 
 // Close the database connection
@@ -411,11 +518,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	chat := toPN(client, msg.Info.Chat)
+	chatJID := chat.String()
+	sender := toPN(client, msg.Info.Sender).User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -834,6 +942,14 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Re-key chats stored under LID JIDs by older bridge versions
+	err = migrateLIDs(messageStore.db,
+		func(j types.JID) types.JID { return toPN(client, j) },
+		func(j types.JID) string { return GetChatName(client, messageStore, j, j.String(), nil, "", logger) })
+	if err != nil {
+		logger.Warnf("Failed to migrate LID chats: %v", err)
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -927,7 +1043,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	// A name equal to the bare number is a fallback, not a real name: retry the lookup.
+	if err == nil && existingName != "" && existingName != jid.User {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1024,6 +1141,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
+		jid = toPN(client, jid)
+		chatJID = jid.String()
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
@@ -1089,6 +1208,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
 						sender = *msg.Message.Key.Participant
+						if p, err := types.ParseJID(sender); err == nil {
+							sender = toPN(client, p).String()
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
