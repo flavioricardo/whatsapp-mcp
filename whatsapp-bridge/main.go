@@ -945,7 +945,13 @@ func main() {
 	// Re-key chats stored under LID JIDs by older bridge versions
 	err = migrateLIDs(messageStore.db,
 		func(j types.JID) types.JID { return toPN(client, j) },
-		func(j types.JID) string { return GetChatName(client, messageStore, j, j.String(), nil, "", logger) })
+		func(j types.JID) string {
+			// Contact lookup only: reading messages.db here would need a second connection during the tx
+			if c, err := client.Store.Contacts.GetContact(context.Background(), j); err == nil && c.FullName != "" {
+				return c.FullName
+			}
+			return j.User
+		})
 	if err != nil {
 		logger.Warnf("Failed to migrate LID chats: %v", err)
 	}
@@ -1142,6 +1148,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 		jid = toPN(client, jid)
+		// whatsmeow stores this sync's LID mappings concurrently, so also use the conversation's own PN
+		if jid.Server == types.HiddenUserServer {
+			if pn, err := types.ParseJID(conversation.GetPnJID()); err == nil && !pn.IsEmpty() {
+				jid = pn
+			}
+		}
 		chatJID = jid.String()
 
 		// Get appropriate chat name by passing the history sync conversation directly
