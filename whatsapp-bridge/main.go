@@ -23,6 +23,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -93,6 +94,20 @@ const messagesSchema = `
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- WhatsApp chat lists / Business labels, synced from app state
+		CREATE TABLE IF NOT EXISTS labels (
+			id TEXT PRIMARY KEY,
+			name TEXT,
+			color INTEGER,
+			list_type TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS chat_labels (
+			chat_jid TEXT,
+			label_id TEXT,
+			PRIMARY KEY (chat_jid, label_id)
+		);
 	`
 
 // toPN resolves a LID JID (@lid) to its phone-number JID using whatsmeow's
@@ -120,7 +135,7 @@ func migrateLIDs(db *sql.DB, toPN func(types.JID) types.JID, nameFor func(types.
 	defer tx.Rollback()
 
 	var lidChats []string
-	rows, err := tx.Query("SELECT jid FROM chats WHERE jid LIKE '%@lid'")
+	rows, err := tx.Query("SELECT jid FROM chats WHERE jid LIKE '%@lid' UNION SELECT chat_jid FROM chat_labels WHERE chat_jid LIKE '%@lid'")
 	if err != nil {
 		return err
 	}
@@ -153,6 +168,9 @@ func migrateLIDs(db *sql.DB, toPN func(types.JID) types.JID, nameFor func(types.
 			{"UPDATE chats SET last_message_time = (SELECT MAX(last_message_time) FROM chats WHERE jid IN (?, ?)) WHERE jid = ?", []interface{}{pnStr, lidStr, pnStr}},
 			{"UPDATE OR REPLACE messages SET chat_jid = ? WHERE chat_jid = ?", []interface{}{pnStr, lidStr}},
 			{"DELETE FROM chats WHERE jid = ?", []interface{}{lidStr}},
+			// Lists: move the LID's labels; leftovers are ones the PN chat already has.
+			{"UPDATE OR IGNORE chat_labels SET chat_jid = ? WHERE chat_jid = ?", []interface{}{pnStr, lidStr}},
+			{"DELETE FROM chat_labels WHERE chat_jid = ?", []interface{}{lidStr}},
 		}
 		for _, s := range stmts {
 			if _, err := tx.Exec(s.q, s.args...); err != nil {
@@ -292,8 +310,36 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
 	return ""
+}
+
+// StoreLabel upserts a chat list / label, or removes it (and its chat links) when deleted.
+func (store *MessageStore) StoreLabel(id, name string, color int32, listType string, deleted bool) error {
+	if deleted {
+		_, err := store.db.Exec("DELETE FROM labels WHERE id = ?; DELETE FROM chat_labels WHERE label_id = ?", id, id)
+		return err
+	}
+	_, err := store.db.Exec("INSERT OR REPLACE INTO labels (id, name, color, list_type) VALUES (?, ?, ?, ?)", id, name, color, listType)
+	return err
+}
+
+// StoreChatLabel adds or removes a chat from a list / label.
+func (store *MessageStore) StoreChatLabel(chatJID, labelID string, labeled bool) error {
+	q := "DELETE FROM chat_labels WHERE chat_jid = ? AND label_id = ?"
+	if labeled {
+		q = "INSERT OR IGNORE INTO chat_labels (chat_jid, label_id) VALUES (?, ?)"
+	}
+	_, err := store.db.Exec(q, chatJID, labelID)
+	return err
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -523,7 +569,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	sender := toPN(client, msg.Info.Sender).User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chat, chatJID, nil, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -699,7 +745,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Prefix the message ID: stored filenames are only unique per second. Base: names come from the sender.
+	localPath = fmt.Sprintf("%s/%s", chatDir, filepath.Base(messageID+"_"+filename))
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -774,13 +821,9 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the query: its oh/oe params sign the path (without them the CDN answers 403).
+	// Only mms3=true is added to the URL on top of the direct path.
+	return "/" + strings.Replace(parts[1], "&mms3=true", "", 1)
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -933,6 +976,8 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	// Full app state syncs (first pairing, label re-fetch) must emit LabelEdit/LabelAssociationChat
+	client.EmitAppStateEventsOnFullSync = true
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -942,18 +987,19 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Contact lookup only: reading messages.db here would need a second connection during the tx
+	nameFor := func(j types.JID) string {
+		if n := contactName(client, j); n != "" {
+			return n
+		}
+		return j.User
+	}
 	// Re-key chats stored under LID JIDs by older bridge versions
-	err = migrateLIDs(messageStore.db,
-		func(j types.JID) types.JID { return toPN(client, j) },
-		func(j types.JID) string {
-			// Contact lookup only: reading messages.db here would need a second connection during the tx
-			if c, err := client.Store.Contacts.GetContact(context.Background(), j); err == nil && c.FullName != "" {
-				return c.FullName
-			}
-			return j.User
-		})
-	if err != nil {
+	if err := migrateLIDs(messageStore.db, func(j types.JID) types.JID { return toPN(client, j) }, nameFor); err != nil {
 		logger.Warnf("Failed to migrate LID chats: %v", err)
+	}
+	if err := renameSelfNamedChats(messageStore.db, ownUser(client), nameFor); err != nil {
+		logger.Warnf("Failed to rename chats named after own number: %v", err)
 	}
 
 	// Setup event handling for messages and history sync
@@ -966,6 +1012,17 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.LabelEdit:
+			a := v.Action
+			if err := messageStore.StoreLabel(v.LabelID, a.GetName(), a.GetColor(), a.GetType().String(), a.GetDeleted()); err != nil {
+				logger.Warnf("Failed to store label %s: %v", v.LabelID, err)
+			}
+
+		case *events.LabelAssociationChat:
+			if err := messageStore.StoreChatLabel(toPN(client, v.JID).String(), v.LabelID, v.Action.GetLabeled()); err != nil {
+				logger.Warnf("Failed to store chat label %s: %v", v.LabelID, err)
+			}
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -1025,6 +1082,16 @@ func main() {
 		return
 	}
 
+	// Labels synced before this bridge version stored them are only in app state: re-fetch it once.
+	// ponytail: re-runs every start while the account has no lists/labels; cheap, add a flag if it isn't.
+	var labelCount int
+	messageStore.db.QueryRow("SELECT COUNT(*) FROM labels").Scan(&labelCount)
+	if labelCount == 0 {
+		if err := client.FetchAppState(context.Background(), appstate.WAPatchRegular, true, false); err != nil {
+			logger.Warnf("Failed to sync chat lists/labels: %v", err)
+		}
+	}
+
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
@@ -1044,13 +1111,68 @@ func main() {
 	client.Disconnect()
 }
 
+// ownUser is the logged-in account's phone number, or "" before pairing.
+func ownUser(client *whatsmeow.Client) string {
+	if client.Store.ID == nil {
+		return ""
+	}
+	return client.Store.ID.User
+}
+
+// contactName is the best known name for a contact, or "" if there is none.
+func contactName(client *whatsmeow.Client, jid types.JID) string {
+	c, err := client.Store.Contacts.GetContact(context.Background(), jid)
+	if err != nil {
+		return ""
+	}
+	for _, n := range []string{c.FullName, c.PushName, c.BusinessName} {
+		if n != "" {
+			return n
+		}
+	}
+	return ""
+}
+
+// renameSelfNamedChats fixes direct chats that older versions named after our own number
+// (the sender of an outgoing first message) instead of the other person.
+func renameSelfNamedChats(db *sql.DB, self string, nameFor func(types.JID) string) error {
+	if self == "" {
+		return nil
+	}
+	rows, err := db.Query("SELECT jid FROM chats WHERE name = ? AND jid NOT LIKE '%@g.us' AND jid != ?", self, self+"@"+types.DefaultUserServer)
+	if err != nil {
+		return err
+	}
+	var jids []string
+	for rows.Next() {
+		var j string
+		if err := rows.Scan(&j); err != nil {
+			rows.Close()
+			return err
+		}
+		jids = append(jids, j)
+	}
+	rows.Close()
+	for _, j := range jids {
+		jid, err := types.ParseJID(j)
+		if err != nil {
+			continue
+		}
+		if _, err := db.Exec("UPDATE chats SET name = ? WHERE jid = ?", nameFor(jid), j); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
-func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
+func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
 	// A name equal to the bare number is a fallback, not a real name: retry the lookup.
-	if err == nil && existingName != "" && existingName != jid.User {
+	// So is our own number, which older versions stored for chats we messaged first.
+	if err == nil && existingName != "" && existingName != jid.User && existingName != ownUser(client) {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1110,15 +1232,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
+		// Contact info, else the bare number
+		if name = contactName(client, jid); name == "" {
 			name = jid.User
 		}
 
@@ -1157,7 +1272,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		chatJID = jid.String()
 
 		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+		name := GetChatName(client, messageStore, jid, chatJID, conversation, logger)
 
 		// Process messages
 		messages := conversation.Messages
@@ -1185,22 +1300,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Unwrap ephemeral / view-once / document-with-caption like live messages are
+				waMsg := (&events.Message{RawMessage: msg.Message.Message}).UnwrapRaw().Message
+				content := extractTextContent(waMsg)
 
 				// Extract media info
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
-				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+				if waMsg != nil {
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(waMsg)
 				}
 
 				// Log the message content for debugging

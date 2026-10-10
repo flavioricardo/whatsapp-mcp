@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional
+import anyio
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -12,7 +13,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    list_labels as whatsapp_list_labels,
+    transcribe_audio as whatsapp_transcribe_audio
 )
 
 # Initialize FastMCP server
@@ -39,7 +42,8 @@ def list_messages(
     page: int = 0,
     include_context: bool = True,
     context_before: int = 1,
-    context_after: int = 1
+    context_after: int = 1,
+    label: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp messages matching specified criteria with optional context.
     
@@ -54,6 +58,7 @@ def list_messages(
         include_context: Whether to include messages before and after matches (default True)
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
+        label: Optional WhatsApp list / label name to only return messages from chats in it (see list_labels)
     """
     messages = whatsapp_list_messages(
         after=after,
@@ -65,7 +70,8 @@ def list_messages(
         page=page,
         include_context=include_context,
         context_before=context_before,
-        context_after=context_after
+        context_after=context_after,
+        label=label
     )
     return messages
 
@@ -75,9 +81,10 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    label: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Get WhatsApp chats matching specified criteria.
+    """Get WhatsApp chats matching specified criteria. Each chat includes the WhatsApp lists / labels it belongs to.
     
     Args:
         query: Optional search term to filter chats by name or JID
@@ -85,13 +92,15 @@ def list_chats(
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+        label: Optional WhatsApp list / label name to only return chats in it (see list_labels)
     """
     chats = whatsapp_list_chats(
         query=query,
         limit=limit,
         page=page,
         include_last_message=include_last_message,
-        sort_by=sort_by
+        sort_by=sort_by,
+        label=label
     )
     return chats
 
@@ -245,6 +254,26 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def list_labels() -> List[Dict[str, Any]]:
+    """List the WhatsApp chat lists (e.g. custom lists, Favorites) and WhatsApp Business labels, with how many chats each has."""
+    return whatsapp_list_labels()
+
+@mcp.tool()
+async def transcribe_audio(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Transcribe a WhatsApp audio/voice message to text (runs locally). Use for messages shown as [audio - Message ID: ... - Chat JID: ...].
+
+    Args:
+        message_id: The ID of the audio message
+        chat_jid: The JID of the chat containing the message
+
+    Returns:
+        A dictionary containing success status and the transcript (or an error message)
+    """
+    # Off the event loop: transcription takes seconds (minutes on first use, while the model downloads)
+    success, text = await anyio.to_thread.run_sync(whatsapp_transcribe_audio, message_id, chat_jid)
+    return {"success": success, "transcript" if success else "message": text}
 
 if __name__ == "__main__":
     # Initialize and run the server
