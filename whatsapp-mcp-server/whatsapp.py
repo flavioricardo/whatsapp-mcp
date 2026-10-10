@@ -5,10 +5,28 @@ from typing import Optional, List, Tuple
 import os.path
 import requests
 import json
+import sys
+import functools
 import audio
+
+# stdout is the MCP stdio channel: diagnostics must go to stderr
+print = functools.partial(print, file=sys.stderr)
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+# Predefined lists (Favorites, Unread...) can have no name: fall back to their type
+LABEL_NAME_SQL = "COALESCE(NULLIF(l.name, ''), l.list_type)"
+# Comma-separated list/label names of the chat whose JID is in column {0}
+LABELS_SQL = f"(SELECT GROUP_CONCAT({LABEL_NAME_SQL}, ', ') FROM chat_labels cl JOIN labels l ON l.id = cl.label_id WHERE cl.chat_jid = {{0}})"
+# Filter on chats in the list/label named by the bound parameter (case-insensitive, accents included)
+LABEL_FILTER_SQL = f"EXISTS (SELECT 1 FROM chat_labels cl JOIN labels l ON l.id = cl.label_id WHERE cl.chat_jid = {{0}} AND casefold({LABEL_NAME_SQL}) = casefold(?))"
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    # SQLite's LOWER only folds ASCII; list names are often accented ("Cardápio")
+    conn.create_function("casefold", 1, lambda v: v.casefold() if isinstance(v, str) else v, deterministic=True)
+    return conn
 
 @dataclass
 class Message:
@@ -29,6 +47,7 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    labels: Optional[str] = None
 
     @property
     def is_group(self) -> bool:
@@ -49,7 +68,7 @@ class MessageContext:
 
 def get_sender_name(sender_jid: str) -> str:
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         # First try matching by exact JID
@@ -91,12 +110,25 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def get_chat_labels(chat_jid: str) -> Optional[str]:
+    try:
+        conn = connect()
+        return conn.execute(f"SELECT {LABELS_SQL.format('?')}", (chat_jid,)).fetchone()[0]
+    except sqlite3.Error:
+        return None
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
     
     if show_chat_info and message.chat_name:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
+        labels = get_chat_labels(message.chat_jid)
+        if labels:
+            output += f"(Lists: {labels}) "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
         
@@ -131,11 +163,12 @@ def list_messages(
     page: int = 0,
     include_context: bool = True,
     context_before: int = 1,
-    context_after: int = 1
+    context_after: int = 1,
+    label: Optional[str] = None
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         # Build base query
@@ -174,6 +207,10 @@ def list_messages(
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
             params.append(f"%{query}%")
+
+        if label:
+            where_clauses.append(LABEL_FILTER_SQL.format("messages.chat_jid"))
+            params.append(label)
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -230,7 +267,7 @@ def get_message_context(
 ) -> MessageContext:
     """Get context around a specific message."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         # Get the target message first
@@ -321,11 +358,12 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    label: Optional[str] = None
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         # Build base query (messages columns only exist when joined)
@@ -335,7 +373,8 @@ def list_chats(
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                {last_cols}
+                {last_cols},
+                {LABELS_SQL.format('chats.jid')}
             FROM chats
         """]
         
@@ -351,6 +390,10 @@ def list_chats(
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
+
+        if label:
+            where_clauses.append(LABEL_FILTER_SQL.format("chats.jid"))
+            params.append(label)
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -375,7 +418,8 @@ def list_chats(
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                labels=chat_data[6]
             )
             result.append(chat)
             
@@ -392,7 +436,7 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         # Split query into characters to support partial matching
@@ -440,7 +484,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -485,7 +529,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -534,7 +578,7 @@ def get_last_interaction(jid: str) -> str:
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         # m columns only exist when joined
@@ -544,7 +588,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 c.jid,
                 c.name,
                 c.last_message_time,
-                {last_cols}
+                {last_cols},
+                {LABELS_SQL.format('c.jid')}
             FROM chats c
         """
         
@@ -568,7 +613,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
+            last_is_from_me=chat_data[5],
+            labels=chat_data[6]
         )
         
     except sqlite3.Error as e:
@@ -582,7 +628,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -764,3 +810,59 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def list_labels() -> List[dict]:
+    """List WhatsApp chat lists / Business labels with how many chats each has."""
+    try:
+        conn = connect()
+        rows = conn.execute(f"""
+            SELECT {LABEL_NAME_SQL}, l.list_type, COUNT(cl.chat_jid)
+            FROM labels l LEFT JOIN chat_labels cl ON cl.label_id = l.id
+            GROUP BY l.id ORDER BY 1
+        """).fetchall()
+        return [{"name": r[0], "type": r[1], "chat_count": r[2]} for r in rows]
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+_whisper_model = None
+
+def transcribe_audio(message_id: str, chat_jid: str) -> Tuple[bool, str]:
+    """Download an audio message and transcribe it locally with faster-whisper.
+
+    Model is set by WHISPER_MODEL (default "small"); it's downloaded on first use.
+    The transcript is cached next to the audio file, per model.
+    """
+    path = download_media(message_id, chat_jid)
+    if not path:
+        return False, "Failed to download audio"
+    model = os.environ.get("WHISPER_MODEL", "small")
+    cache = f"{path}.{os.path.basename(model)}.txt"
+    if os.path.isfile(cache):
+        with open(cache, encoding="utf-8") as f:
+            return True, f.read()
+
+    global _whisper_model
+    try:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel  # lazy: heavy import, only needed here
+            _whisper_model = WhisperModel(model, device="cpu", compute_type="int8")
+        segments, _ = _whisper_model.transcribe(path, vad_filter=True)
+        text = " ".join(s.text.strip() for s in segments).strip()
+    except Exception as e:
+        return False, f"Transcription failed: {e}"
+
+    if not text:
+        return False, "No speech detected in the audio"
+    try:
+        with open(cache + ".tmp", "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(cache + ".tmp", cache)
+    except OSError as e:
+        print(f"Failed to cache transcript: {e}")
+    return True, text

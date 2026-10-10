@@ -140,6 +140,10 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **transcribe_audio**: Transcribe an audio/voice message to text, locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (no API key). Set `WHISPER_MODEL` (default `small`) to trade speed for accuracy; the model is downloaded on first use
+- **list_labels**: List your WhatsApp chat lists (and WhatsApp Business labels). `list_chats` and `list_messages` show each chat's lists and accept a `label` filter
+
+> **Upgrading:** restart the Go bridge before the MCP server, since the bridge creates the list tables and syncs your existing lists on its first start. Image/video/document captions are stored only for messages received after the upgrade. The first `transcribe_audio` call downloads the Whisper model (~500 MB for `small`) and can take a few minutes.
 
 ### Media Handling Features
 
