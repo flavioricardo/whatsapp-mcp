@@ -14,12 +14,58 @@ Here's an example of what you can do when it's connected to Claude.
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
+## About this fork
+
+This is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) that makes the bridge connect to WhatsApp again (upstream's version is rejected) and adds a few features.
+
+### New features
+
+- **Audio transcription:** the `transcribe_audio` tool turns voice and audio messages into text. It runs locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so it needs no API key and the audio never leaves your machine.
+- **Media captions:** the text sent with an image, video or document is stored as the message content, so it shows up in `list_messages` and in searches.
+- **Chat lists and Business labels:** the bridge syncs the lists you see as filters in WhatsApp's Chats tab (Favorites, your custom lists) and WhatsApp Business labels.
+  - `list_chats` and `get_chat` show the lists each chat is in, and messages show `(Lists: ...)`.
+  - `list_chats` and `list_messages` accept a `label` filter: the exact list name, ignoring upper/lower case (accented letters included).
+  - The new `list_labels` tool lists them all with their chat counts.
+
+### Fixes
+
+- **The bridge connects again:** WhatsApp rejected the old whatsmeow version ("Client outdated (405)", no QR code). whatsmeow is updated, which needs Go 1.26+.
+- **Chats keyed by phone number:** WhatsApp now addresses chats by LID (`@lid`). The bridge converts LIDs to phone-number JIDs, so contact search and sending by phone number work again. Chats stored under LIDs are migrated on startup when their phone number is known.
+- **Media downloads work again:** `download_media` failed for every message (HTTP 403), because the signed part of the media URL was dropped.
+- **Downloaded file names:** files are saved as `<message id>_<filename>`. Before, two files received in the same second got the same name, and a sender could choose a document name that wrote outside `store/`.
+- **Chat names:** direct chats were sometimes named after your own number. Names now come from the contact (saved name, then profile name, then business name), else the phone number. Existing chats are fixed on startup.
+- **`list_chats` / `get_chat` with `include_last_message=False`** returned nothing; they now return the chats.
+- **History sync** now reads disappearing, view-once and document-with-caption messages the same way as live ones.
+- The MCP server's log messages no longer go to stdout, where they could corrupt the replies sent to Claude.
+
+### Upgrading from upstream
+
+If you already run upstream:
+
+1. Switch your clone to this fork:
+
+   ```bash
+   git remote set-url origin https://github.com/flavioricardo/whatsapp-mcp.git
+   git pull
+   ```
+
+2. Install the new Python dependencies once, so the MCP server's first start isn't slow:
+
+   ```bash
+   cd whatsapp-mcp-server
+   uv sync
+   ```
+
+3. Stop the bridge and start it again (`cd whatsapp-bridge && go run main.go`), then restart Claude Desktop / Cursor.
+
+Start the bridge first: it creates the new tables and syncs your existing lists. Until it does, `list_chats` and `get_chat` return nothing. Captions are stored only for messages received after the upgrade, and media downloaded before the upgrade is fetched again under the new file name.
+
 ## Installation
 
 ### Prerequisites
 
 - Go 1.26+
-- Python 3.6+
+- Python 3.11+
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
@@ -29,7 +75,7 @@ Here's an example of what you can do when it's connected to Claude.
 1. **Clone this repository**
 
    ```bash
-   git clone https://github.com/lharries/whatsapp-mcp.git
+   git clone https://github.com/flavioricardo/whatsapp-mcp.git
    cd whatsapp-mcp
    ```
 
@@ -140,10 +186,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
-- **transcribe_audio**: Transcribe an audio/voice message to text, locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (no API key). Set `WHISPER_MODEL` (default `small`) to trade speed for accuracy; the model is downloaded on first use
+- **transcribe_audio**: Transcribe an audio/voice message to text, locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (no API key). Set `WHISPER_MODEL` (default `small`) to trade speed for accuracy; the first call downloads the model (~500 MB for `small`) and can take a few minutes
 - **list_labels**: List your WhatsApp chat lists (and WhatsApp Business labels). `list_chats` and `list_messages` show each chat's lists and accept a `label` filter
-
-> **Upgrading:** restart the Go bridge before the MCP server, since the bridge creates the list tables and syncs your existing lists on its first start. Image/video/document captions are stored only for messages received after the upgrade. The first `transcribe_audio` call downloads the Whisper model (~500 MB for `small`) and can take a few minutes.
 
 ### Media Handling Features
 
@@ -162,6 +206,8 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+For audio and voice messages, `transcribe_audio` (same arguments) downloads the audio and returns its text. It doesn't need FFmpeg. The transcript is saved next to the audio file, so asking again with the same model is instant.
 
 ## Technical Details
 
