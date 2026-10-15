@@ -3,6 +3,7 @@
 # Origem: flavioricardo/claude-config (templates/hooks). Stdout vira contexto
 # da sessão. Nunca falha a sessão: qualquer erro sai com 0.
 cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
+command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }   # macOS não tem
 
 if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
   # Nuvem: nada de ~/.claude aqui, então o lembrete do caveman vem daqui.
