@@ -8,10 +8,15 @@
 
 ## Status
 
-- **Fase:**
-- **No ar:**
+- **Fase:** em uso pessoal diário — MCP `whatsapp` conectado ao Claude Code local.
+- **No ar:** só local, sem deploy: bridge Go (`whatsapp-bridge/`, whatsmeow +
+  SQLite) e servidor MCP Python (`whatsapp-mcp-server/`).
 
 ## Decisões
+
+- Fork de `lharries/whatsapp-mcp`: a bridge do upstream é rejeitada pelo
+  WhatsApp; este fork reconecta e soma transcrição local (faster-whisper),
+  legendas de mídia e listas/etiquetas do Business (ver README).
 
 ## Pendências
 
