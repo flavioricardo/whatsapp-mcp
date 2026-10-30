@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -356,7 +357,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -515,10 +516,17 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// WhatsApp doesn't echo our own sends back as events.Message: without this they never reach messages.db
+	chat := toPN(client, recipientJID)
+	name := GetChatName(client, messageStore, chat, chat.String(), nil, client.Log)
+	if err := storeMessage(messageStore, chat.String(), name, ownUser(client), resp.ID, resp.Timestamp, true, msg); err != nil {
+		client.Log.Warnf("Message sent but not stored: %v", err)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -563,65 +571,44 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
 	chat := toPN(client, msg.Info.Chat)
 	chatJID := chat.String()
-	sender := toPN(client, msg.Info.Sender).User
-
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, chat, chatJID, nil, logger)
-
-	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
-	if err != nil {
-		logger.Warnf("Failed to store chat: %v", err)
-	}
-
-	// Extract text content
-	content := extractTextContent(msg.Message)
-
-	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
-
-	// Skip if there's no content and no media
-	if content == "" && mediaType == "" {
-		return
-	}
-
-	// Store message in database
-	err = messageStore.StoreMessage(
-		msg.Info.ID,
-		chatJID,
-		sender,
-		content,
-		msg.Info.Timestamp,
-		msg.Info.IsFromMe,
-		mediaType,
-		filename,
-		url,
-		mediaKey,
-		fileSHA256,
-		fileEncSHA256,
-		fileLength,
-	)
-
-	if err != nil {
+	sender := toPN(client, msg.Info.Sender).User
+	if err := storeMessage(messageStore, chatJID, name, sender, msg.Info.ID, msg.Info.Timestamp, msg.Info.IsFromMe, msg.Message); err != nil {
 		logger.Warnf("Failed to store message: %v", err)
-	} else {
-		// Log message reception
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
-
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
 	}
+}
+
+// storeMessage bumps the chat's last message time and saves the message (text and/or media).
+// Used for received messages and for the ones the bridge sends, which WhatsApp doesn't echo back.
+func storeMessage(messageStore *MessageStore, chatJID, name, sender, id string, timestamp time.Time, isFromMe bool, m *waProto.Message) error {
+	chatErr := messageStore.StoreChat(chatJID, name, timestamp)
+
+	content := extractTextContent(m)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(m)
+	if content == "" && mediaType == "" {
+		return chatErr
+	}
+
+	err := messageStore.StoreMessage(id, chatJID, sender, content, timestamp, isFromMe,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+	if err != nil {
+		return errors.Join(chatErr, err)
+	}
+
+	direction := "←"
+	if isFromMe {
+		direction = "→"
+	}
+	ts := timestamp.Format("2006-01-02 15:04:05")
+	if mediaType != "" {
+		fmt.Printf("[%s] %s %s: [%s: %s] %s\n", ts, direction, sender, mediaType, filename, content)
+	} else {
+		fmt.Printf("[%s] %s %s: %s\n", ts, direction, sender, content)
+	}
+	return chatErr
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -857,7 +844,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
