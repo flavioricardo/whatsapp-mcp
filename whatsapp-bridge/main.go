@@ -110,6 +110,12 @@ const messagesSchema = `
 			label_id TEXT,
 			PRIMARY KEY (chat_jid, label_id)
 		);
+
+		-- One row, rewritten every minute while the bridge is connected and can write here
+		CREATE TABLE IF NOT EXISTS bridge_status (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			heartbeat TIMESTAMP
+		);
 	`
 
 // toPN resolves a LID JID (@lid) to its phone-number JID using whatsmeow's
@@ -1082,6 +1088,17 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Heartbeat for the watchdog (run-bridge.ps1) and anything reading messages.db
+	go func() {
+		os.MkdirAll("logs", 0755)
+		for {
+			if err := beat(client.IsConnected(), messageStore, "logs/heartbeat.txt", time.Now()); err != nil {
+				logger.Warnf("No heartbeat: %v", err)
+			}
+			time.Sleep(time.Minute)
+		}
+	}()
+
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
@@ -1097,6 +1114,19 @@ func main() {
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+}
+
+// beat records that the bridge can do its job: connected to WhatsApp and able to write messages.db.
+// A live process isn't enough: on 29/10 one ran for 50 min storing nothing.
+// ponytail: a handler stuck while both hold still beats; whatsmeow logs "Node handling is taking long" then.
+func beat(connected bool, messageStore *MessageStore, file string, now time.Time) error {
+	if !connected {
+		return errors.New("not connected to WhatsApp")
+	}
+	if _, err := messageStore.db.Exec("INSERT OR REPLACE INTO bridge_status (id, heartbeat) VALUES (1, ?)", now); err != nil {
+		return fmt.Errorf("can't write messages.db: %w", err)
+	}
+	return os.WriteFile(file, []byte(now.Format("2006-01-02T15:04:05")), 0644)
 }
 
 // ownUser is the logged-in account's phone number, or "" before pairing.
