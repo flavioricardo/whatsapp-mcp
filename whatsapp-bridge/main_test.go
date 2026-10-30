@@ -2,6 +2,8 @@ package main
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -240,5 +242,49 @@ func TestStoreSentMessage(t *testing.T) {
 	db.QueryRow("SELECT name FROM chats WHERE jid = '5571@s.whatsapp.net'").Scan(&name)
 	if name != "Joseane" {
 		t.Errorf("chat name = %q, want Joseane", name)
+	}
+}
+
+// The watchdog and the CRM only see the heartbeat: it must stop when the bridge can't do its job.
+func TestBeat(t *testing.T) {
+	db, err := sql.Open("sqlite3", "file::memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(messagesSchema); err != nil {
+		t.Fatal(err)
+	}
+	s := &MessageStore{db: db}
+	file := filepath.Join(t.TempDir(), "heartbeat.txt")
+	now := time.Date(2026, 10, 30, 13, 0, 0, 0, time.Local)
+
+	if beat(false, s, file, now) == nil {
+		t.Error("beat while disconnected: no error")
+	}
+	if _, err := os.Stat(file); err == nil {
+		t.Fatal("heartbeat written while disconnected")
+	}
+	for range 2 {
+		if err := beat(true, s, file, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if b, _ := os.ReadFile(file); string(b) != "2026-10-30T13:00:00" {
+		t.Errorf("heartbeat file = %q", b)
+	}
+	var n int
+	db.QueryRow("SELECT COUNT(*) FROM bridge_status").Scan(&n)
+	if n != 1 {
+		t.Errorf("bridge_status rows = %d, want 1", n)
+	}
+
+	db.Close() // messages.db can't be written
+	os.Remove(file)
+	if beat(true, s, file, now) == nil {
+		t.Error("beat with a broken messages.db: no error")
+	}
+	if _, err := os.Stat(file); err == nil {
+		t.Error("heartbeat written while messages.db can't be written")
 	}
 }

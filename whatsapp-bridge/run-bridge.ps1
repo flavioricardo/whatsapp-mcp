@@ -1,6 +1,6 @@
 # Watchdog for the WhatsApp bridge on Windows: restarts it when it dies, logs its output
-# to logs\bridge-YYYY-MM-DD.log (its own events to logs\watchdog.log) and touches
-# logs\heartbeat.txt every minute while it runs.
+# to logs\bridge-YYYY-MM-DD.log (its own events to logs\watchdog.log) and kills it when
+# logs\heartbeat.txt goes stale (the bridge touches it every minute while connected and writing).
 # Install/uninstall as a logon task: see "Keep the bridge running on Windows" in the README.
 param(
     [string]$Dir = $PSScriptRoot,              # folder with the exe and store\ (paths are relative)
@@ -32,7 +32,7 @@ while ($true) {
         $p = Start-Process cmd.exe -ArgumentList "/c `"`"$Dir\$Exe`" >> `"$log`" 2>&1`"" `
             -WorkingDirectory $Dir -WindowStyle Hidden -PassThru
     }
-    # Without a handle WaitForExit throws and the loop below would spin with a fake heartbeat
+    # Without a handle WaitForExit throws and the loop below would spin
     # (exe missing mid-rebuild, or a bridge started elevated); Handle also keeps ExitCode readable
     try { $null = $p.Handle } catch {
         Write-Log "can't start or watch the bridge: $_"
@@ -40,10 +40,16 @@ while ($true) {
         continue
     }
 
-    # ponytail: says the process is alive, not that it is connected to WhatsApp
-    do {
-        Set-Content $heartbeat (Get-Date -Format s) -ErrorAction SilentlyContinue  # a reader may hold it open
-    } until ($p.WaitForExit(60000))
+    # Alive but no heartbeat for 5 min (offline, logged out, messages.db unwritable): kill it, the loop restarts it
+    $since = Get-Date
+    while (-not $p.WaitForExit(60000)) {
+        $fresh = Get-Item $heartbeat -ErrorAction SilentlyContinue | Where-Object LastWriteTime -gt (Get-Date).AddMinutes(-5)
+        if (-not $fresh -and $since -lt (Get-Date).AddMinutes(-5)) {
+            Write-Log 'no heartbeat for 5 min, killing the bridge'
+            # By name: $p may be the cmd wrapper, which wouldn't take the exe down with it
+            Stop-Process -Name whatsapp-bridge, whatsapp-bridge-bg -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     Write-Log "bridge exited (code $($p.ExitCode)), restarting in 15s"
     Start-Sleep 15
