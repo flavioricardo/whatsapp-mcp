@@ -18,6 +18,19 @@
   WhatsApp; este fork reconecta e soma transcrição local (faster-whisper),
   legendas de mídia e listas/etiquetas do Business (ver README).
 
+- Bridge no Windows do Flávio roda pela tarefa agendada `WhatsAppBridge`
+  (vigia `whatsapp-bridge/run-bridge.ps1`, ver README "Keep the bridge running
+  on Windows"). Logs e heartbeat em `whatsapp-bridge/logs/`; o heartbeat só
+  diz que o processo existe, não que está conectado. O Cardápio Zap lê
+  `store/messages.db`.
+
 ## Pendências
 
 <!-- Formato: - [ ] **Ação exata** → link direto | trava: … | [humano] se só o Flávio fecha -->
+- [ ] **Gravar no `messages.db` as mensagens enviadas pela API REST** (`is_from_me=1`):
+  `sendWhatsAppMessage` em `whatsapp-bridge/main.go` só chama `client.SendMessage`
+  e não chama `StoreMessage`; o whatsmeow não emite `events.Message` pro que o
+  próprio cliente envia. Só entra o que sai pelo celular.
+- [ ] **Detectar ponte viva mas travada** (caso 29/10 19:14–20:05): heartbeat
+  atual é só de processo. Ideia: gravar heartbeat só quando
+  `client.IsConnected()`, dentro do Go.

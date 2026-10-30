@@ -160,18 +160,23 @@ Only one watchdog runs at a time, and it never starts a second bridge: if one is
 
 Build the exe first (`go build -o whatsapp-bridge-bg.exe`, with the CGO setup above) and pair it once by running it by hand, since the watchdog runs hidden and can't show the QR code.
 
-**Install** as a task that starts at logon and is restarted if the watchdog itself dies (PowerShell, no admin needed; fix the path):
+**Install** as a task that starts at logon and, every 5 minutes, starts the watchdog again if it died (PowerShell, no admin needed; fix the path):
 
 ```powershell
 $script = "D:\path\to\whatsapp-mcp\whatsapp-bridge\run-bridge.ps1"
 $action = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName WhatsAppBridge -Action $action -Trigger $trigger -Settings $settings
+$triggers = @(
+    New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName WhatsAppBridge -Action $action -Trigger $triggers -Settings $settings
 Start-ScheduledTask WhatsAppBridge
 ```
 
-`-ExecutionTimeLimit 0` matters: the default stops the task after 3 days. The task runs at logon, so the bridge is up after a reboot once you log in.
+`-ExecutionTimeLimit 0` matters: the default stops the task after 3 days. The repeating trigger is what brings a dead watchdog back: Task Scheduler's "restart on failure" doesn't fire when the script is killed. While the watchdog runs, `IgnoreNew` skips the repeats. The task runs at logon, so the bridge is up after a reboot once you log in.
+
+If the bridge log fills with QR codes, the device was logged out: stop the task, run the exe by hand to scan the code, then start the task again.
 
 **Uninstall** (stopping the task stops the watchdog; the bridge itself keeps running until you stop it):
 

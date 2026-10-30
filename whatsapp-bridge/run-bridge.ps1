@@ -32,7 +32,13 @@ while ($true) {
         $p = Start-Process cmd.exe -ArgumentList "/c `"`"$Dir\$Exe`" >> `"$log`" 2>&1`"" `
             -WorkingDirectory $Dir -WindowStyle Hidden -PassThru
     }
-    $null = $p.Handle  # keeps ExitCode readable after exit
+    # Without a handle WaitForExit throws and the loop below would spin with a fake heartbeat
+    # (exe missing mid-rebuild, or a bridge started elevated); Handle also keeps ExitCode readable
+    try { $null = $p.Handle } catch {
+        Write-Log "can't start or watch the bridge: $_"
+        Start-Sleep 60
+        continue
+    }
 
     # ponytail: says the process is alive, not that it is connected to WhatsApp
     do {
