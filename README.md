@@ -152,6 +152,42 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+### Keep the bridge running on Windows
+
+`whatsapp-bridge/run-bridge.ps1` is a watchdog: it starts `whatsapp-bridge-bg.exe` from the `whatsapp-bridge` folder, restarts it 15 seconds after it exits, and appends stdout and stderr to `whatsapp-bridge/logs/bridge-YYYY-MM-DD.log` (named after the day the bridge started). Its own starts and exits (with exit code) go to `whatsapp-bridge/logs/watchdog.log`. While the bridge process is alive it writes the current time to `whatsapp-bridge/logs/heartbeat.txt` every minute, so anything reading `messages.db` can treat a heartbeat older than ~3 minutes as "bridge down". The heartbeat only means the process is running, not that it is connected to WhatsApp.
+
+Only one watchdog runs at a time, and it never starts a second bridge: if one is already running (started by hand, say), it waits for that one to exit. Two bridges on the same device kick each other off WhatsApp.
+
+Build the exe first (`go build -o whatsapp-bridge-bg.exe`, with the CGO setup above) and pair it once by running it by hand, since the watchdog runs hidden and can't show the QR code.
+
+**Install** as a task that starts at logon and, every 5 minutes, starts the watchdog again if it died (PowerShell, no admin needed; fix the path):
+
+```powershell
+$script = "D:\path\to\whatsapp-mcp\whatsapp-bridge\run-bridge.ps1"
+$action = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`""
+$triggers = @(
+    New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName WhatsAppBridge -Action $action -Trigger $triggers -Settings $settings
+Start-ScheduledTask WhatsAppBridge
+```
+
+`-ExecutionTimeLimit 0` matters: the default stops the task after 3 days. The repeating trigger is what brings a dead watchdog back: Task Scheduler's "restart on failure" doesn't fire when the script is killed. While the watchdog runs, `IgnoreNew` skips the repeats. The task runs at logon, so the bridge is up after a reboot once you log in.
+
+If the bridge log fills with QR codes, the device was logged out: stop the task, run the exe by hand to scan the code, then start the task again.
+
+**Uninstall** (stopping the task stops the watchdog; the bridge itself keeps running until you stop it):
+
+```powershell
+Stop-ScheduledTask WhatsAppBridge
+Unregister-ScheduledTask WhatsAppBridge -Confirm:$false
+Stop-Process -Name whatsapp-bridge-bg
+```
+
+To restart the bridge, just stop the process (`Stop-Process -Name whatsapp-bridge-bg`): the watchdog starts it again. To stop it for longer, stop the task first.
+
 ## Architecture Overview
 
 This application consists of two main components:
