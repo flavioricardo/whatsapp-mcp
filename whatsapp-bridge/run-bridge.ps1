@@ -41,8 +41,14 @@ while ($true) {
     }
 
     # Alive but no heartbeat for 5 min (offline, logged out, messages.db unwritable): kill it, the loop restarts it
-    $since = Get-Date
+    $since = $last = Get-Date
     while (-not $p.WaitForExit(60000)) {
+        # Minutes between two checks means the PC slept: the heartbeat is old but the bridge reconnects on its own
+        if ($last -lt (Get-Date).AddMinutes(-2)) {
+            Write-Log "no check since $($last.ToString('s')) (PC asleep?), giving the bridge 5 min to reconnect"
+            $since = Get-Date
+        }
+        $last = Get-Date
         $fresh = Get-Item $heartbeat -ErrorAction SilentlyContinue | Where-Object LastWriteTime -gt (Get-Date).AddMinutes(-5)
         if (-not $fresh -and $since -lt (Get-Date).AddMinutes(-5)) {
             Write-Log 'no heartbeat for 5 min, killing the bridge'
