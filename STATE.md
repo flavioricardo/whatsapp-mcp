@@ -27,10 +27,6 @@
 ## Pendências
 
 <!-- Formato: - [ ] **Ação exata** → link direto | trava: … | [humano] se só o Flávio fecha -->
-- [ ] **Gravar no `messages.db` as mensagens enviadas pela API REST** (`is_from_me=1`):
-  `sendWhatsAppMessage` em `whatsapp-bridge/main.go` só chama `client.SendMessage`
-  e não chama `StoreMessage`; o whatsmeow não emite `events.Message` pro que o
-  próprio cliente envia. Só entra o que sai pelo celular.
 - [ ] **Detectar ponte viva mas travada** (caso 29/10 19:14–20:05): heartbeat
   atual é só de processo. Ideia: gravar heartbeat só quando
   `client.IsConnected()`, dentro do Go.

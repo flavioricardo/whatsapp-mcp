@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
@@ -209,5 +210,35 @@ func TestHistoryUnwrap(t *testing.T) {
 	}
 	if (&events.Message{}).UnwrapRaw().Message != nil {
 		t.Error("nil raw message should unwrap to nil")
+	}
+}
+
+// Messages the bridge sends get no events.Message echo, so the send path stores them itself.
+func TestStoreSentMessage(t *testing.T) {
+	db, err := sql.Open("sqlite3", "file::memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(messagesSchema); err != nil {
+		t.Fatal(err)
+	}
+	s := &MessageStore{db: db}
+	ts := time.Date(2026, 10, 30, 11, 34, 0, 0, time.UTC)
+
+	img := &waProto.Message{ImageMessage: &waProto.ImageMessage{Caption: proto.String("cardápio"), Mimetype: proto.String("image/jpeg"), URL: proto.String("https://mmg.whatsapp.net/x.enc")}}
+	if err := storeMessage(s, "5571@s.whatsapp.net", "Joseane", "5511", "ID1", ts, true, img); err != nil {
+		t.Fatal(err)
+	}
+	var content, mediaType, name string
+	var fromMe bool
+	db.QueryRow("SELECT content, media_type, is_from_me FROM messages WHERE id = 'ID1'").Scan(&content, &mediaType, &fromMe)
+	if content != "cardápio" || mediaType != "image" || !fromMe {
+		t.Errorf("stored (%q, %q, from_me=%v), want (cardápio, image, true)", content, mediaType, fromMe)
+	}
+	db.QueryRow("SELECT name FROM chats WHERE jid = '5571@s.whatsapp.net'").Scan(&name)
+	if name != "Joseane" {
+		t.Errorf("chat name = %q, want Joseane", name)
 	}
 }
