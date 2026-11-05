@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -8,11 +9,87 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// unpairedClient is what main gets after the server removes the device (or before the first
+// pairing): no ID, and no LID map or contact store until the device is saved.
+func unpairedClient(t *testing.T) *whatsmeow.Client {
+	t.Helper()
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:"+filepath.Join(t.TempDir(), "wa.db")+"?_foreign_keys=on", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { container.Close() })
+	return whatsmeow.NewClient(container.NewDevice(), nil)
+}
+
+func TestToPNWithoutSession(t *testing.T) {
+	client := unpairedClient(t)
+	lid := types.NewJID("111", types.HiddenUserServer)
+	if got := toPN(client, lid); got != lid {
+		t.Errorf("toPN = %v, want %v unchanged", got, lid)
+	}
+}
+
+func TestMigrateStoredChatsWaitsForSession(t *testing.T) {
+	ctx := context.Background()
+	client := unpairedClient(t)
+	db, err := sql.Open("sqlite3", "file::memory:?_foreign_keys=on")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1) // keep the single in-memory DB
+	if _, err := db.Exec(messagesSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chats VALUES ('111@lid','111','2026-10-01 10:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	chat := func() string {
+		t.Helper()
+		var jid string
+		if err := db.QueryRow("SELECT jid FROM chats").Scan(&jid); err != nil {
+			t.Fatal(err)
+		}
+		return jid
+	}
+
+	migrateStoredChats(client, db, waLog.Noop)
+	if got := chat(); got != "111@lid" {
+		t.Fatalf("without a session chat = %s, want it untouched", got)
+	}
+
+	// Pairing sets the ID and saves the device, which is what gives it a LID map
+	own := types.NewJID("5511999990000", types.DefaultUserServer)
+	client.Store.ID = &own
+	client.Store.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             []byte{0},
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+	if err := client.Store.Save(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lid, pn := types.NewJID("111", types.HiddenUserServer), types.NewJID("5511999990001", types.DefaultUserServer)
+	if err := client.Store.LIDs.PutLIDMapping(ctx, lid, pn); err != nil {
+		t.Fatal(err)
+	}
+
+	migrateStoredChats(client, db, waLog.Noop)
+	if got := chat(); got != pn.String() {
+		t.Errorf("after pairing chat = %s, want %s", got, pn)
+	}
+}
 
 func TestMigrateLIDs(t *testing.T) {
 	db, err := sql.Open("sqlite3", "file::memory:?_foreign_keys=on")
