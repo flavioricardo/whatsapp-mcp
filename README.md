@@ -176,7 +176,7 @@ Start-ScheduledTask WhatsAppBridge
 
 `-ExecutionTimeLimit 0` matters: the default stops the task after 3 days. The repeating trigger is what brings a dead watchdog back: Task Scheduler's "restart on failure" doesn't fire when the script is killed. While the watchdog runs, `IgnoreNew` skips the repeats. The task runs at logon, so the bridge is up after a reboot once you log in.
 
-If the bridge log fills with QR codes, the device was logged out: stop the task, run the exe by hand to scan the code, then start the task again.
+If the bridge log fills with QR codes, the device was logged out: run `Disable-ScheduledTask WhatsAppBridge; Stop-ScheduledTask WhatsAppBridge`, run the exe by hand to scan the code, stop it, then `Enable-ScheduledTask WhatsAppBridge; Start-ScheduledTask WhatsAppBridge`. Stopping alone isn't enough: the 5-minute trigger brings the watchdog back, and it kills a bridge with no heartbeat, even one started by hand and waiting for the scan.
 
 **Uninstall** (stopping the task stops the watchdog; the bridge itself keeps running until you stop it):
 

@@ -120,10 +120,11 @@ const messagesSchema = `
 
 // toPN resolves a LID JID (@lid) to its phone-number JID using whatsmeow's
 // LID map, so chats and senders are keyed by phone number. Other JIDs, and
-// LIDs with no known mapping, are returned unchanged.
+// LIDs with no known mapping, are returned unchanged. So are all LIDs without a
+// session: whatsmeow only sets Store.LIDs once the device is paired and saved.
 func toPN(client *whatsmeow.Client, jid types.JID) types.JID {
 	jid = jid.ToNonAD()
-	if jid.Server != types.HiddenUserServer {
+	if jid.Server != types.HiddenUserServer || client.Store.LIDs == nil {
 		return jid
 	}
 	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
@@ -131,6 +132,29 @@ func toPN(client *whatsmeow.Client, jid types.JID) types.JID {
 		return jid
 	}
 	return pn
+}
+
+// migrateStoredChats fixes rows written by older bridge versions. It needs the
+// session's LID map and contacts, so without a session it does nothing and main
+// calls it again right after pairing.
+func migrateStoredChats(client *whatsmeow.Client, db *sql.DB, logger waLog.Logger) {
+	if client.Store.ID == nil {
+		return
+	}
+	// Contact lookup only: reading messages.db here would need a second connection during the tx
+	nameFor := func(j types.JID) string {
+		if n := contactName(client, j); n != "" {
+			return n
+		}
+		return j.User
+	}
+	// Re-key chats stored under LID JIDs by older bridge versions
+	if err := migrateLIDs(db, func(j types.JID) types.JID { return toPN(client, j) }, nameFor); err != nil {
+		logger.Warnf("Failed to migrate LID chats: %v", err)
+	}
+	if err := renameSelfNamedChats(db, ownUser(client), nameFor); err != nil {
+		logger.Warnf("Failed to rename chats named after own number: %v", err)
+	}
 }
 
 // migrateLIDs re-keys chats and message senders stored under LID JIDs (by
@@ -981,20 +1005,7 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// Contact lookup only: reading messages.db here would need a second connection during the tx
-	nameFor := func(j types.JID) string {
-		if n := contactName(client, j); n != "" {
-			return n
-		}
-		return j.User
-	}
-	// Re-key chats stored under LID JIDs by older bridge versions
-	if err := migrateLIDs(messageStore.db, func(j types.JID) types.JID { return toPN(client, j) }, nameFor); err != nil {
-		logger.Warnf("Failed to migrate LID chats: %v", err)
-	}
-	if err := renameSelfNamedChats(messageStore.db, ownUser(client), nameFor); err != nil {
-		logger.Warnf("Failed to rename chats named after own number: %v", err)
-	}
+	migrateStoredChats(client, messageStore.db, logger)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -1054,6 +1065,7 @@ func main() {
 		select {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
+			migrateStoredChats(client, messageStore.db, logger) // skipped at startup: there was no session
 		case <-time.After(3 * time.Minute):
 			logger.Errorf("Timeout waiting for QR code scan")
 			return
