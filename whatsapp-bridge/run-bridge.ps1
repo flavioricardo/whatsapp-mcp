@@ -22,7 +22,7 @@ while ($true) {
     # ponytail: file is named after the day the bridge started, not rotated while it runs
     $log = Join-Path $logs "bridge-$(Get-Date -Format yyyy-MM-dd).log"
 
-    # A bridge started by hand is waited on, not duplicated
+    # A bridge started by hand is waited on, not duplicated (the heartbeat check below still kills it)
     $p = Get-Process -Name whatsapp-bridge, whatsapp-bridge-bg -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($p) {
         Write-Log "bridge already running (pid $($p.Id)), waiting for it to exit"

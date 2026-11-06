@@ -25,6 +25,10 @@
   e gravando no banco; 5 min sem ele, o vigia mata e relança. O Cardápio Zap lê
   `store/messages.db`.
 
+- O servidor removeu o aparelho em 04/11/2026 18:01 (`401 device_removed`), sem
+  aviso antes no log; motivo desconhecido, pode repetir. Se repetir: novo QR
+  (README, fim de "Keep the bridge running on Windows").
+
 ## Pendências
 
 <!-- Formato: - [ ] **Ação exata** → link direto | trava: … | [humano] se só o Flávio fecha -->
